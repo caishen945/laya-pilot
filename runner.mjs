@@ -12,6 +12,29 @@ import {switchLanguage} from './lib/readiness.mjs';
 const ROOT=path.dirname(fileURLToPath(import.meta.url)),args=process.argv.slice(2);
 const arg=(n,d)=>{const i=args.indexOf(n);if(i<0)return d;if(!args[i+1]||args[i+1].startsWith('--'))throw Error(n+'缺少参数');return args[i+1];};
 const flag=n=>args.includes(n);
+
+// RFC6238 TOTP（SHA1/6位/30s，零依赖）
+function base32Decode(s){
+  const A='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits=0,val=0,out=[];
+  for(const ch of s.toUpperCase().replace(/=+$/,'')){
+    const idx=A.indexOf(ch);if(idx<0)continue;
+    val=(val<<5)|idx;bits+=5;
+    if(bits>=8){out.push((val>>>(bits-8))&0xff);bits-=8;}
+  }
+  return Buffer.from(out);
+}
+function totpNow(secretB32){
+  const key=base32Decode(secretB32);
+  const counter=Math.floor(Date.now()/30000);
+  const buf=Buffer.alloc(8);
+  buf.writeUInt32BE(Math.floor(counter/2**32),0);
+  buf.writeUInt32BE((counter%2**32)>>>0,4);
+  const hmac=require('node:crypto').createHmac('sha1',key).update(buf).digest();
+  const off=hmac[19]&0xf;
+  const code=((hmac[off]&0x7f)<<24|(hmac[off+1]&0xff)<<16|(hmac[off+2]&0xff)<<8|(hmac[off+3]&0xff))%1e6;
+  return String(code).padStart(6,'0');
+}
 await loadLocalEnvironment(ROOT);
 const fileConfig=await loadProjectConfig(arg('--config',''));
 const option=(cli,env,key,fallback)=>configured(arg,cli,env,fileConfig[key],fallback);
@@ -103,10 +126,31 @@ async function main(){
   console.log('页面语言：'+await switchLanguage(page,config.language));
   // 确定性登录：登录页结构固定（email+password+submit），不经 LLM 决策（避免措辞抖动，
   // 且账号框文案如「管理员邮箱/邮箱地址」与通用意图「账号」不总匹配）
-  const account=page.locator('input[type="email"]:visible').first();if(await account.count()===0)throw Error('登录页未找到 email 输入框，请用 --manual-login');await account.fill(config.user);
+  const account=page.locator('input[type="email"]:visible').first();if(await account.count()===0){const text=page.locator('input:not([type="password"]):visible').first();if(await text.count()===0)throw Error('登录页未找到 email/用户名 输入框，请用 --manual-login');await text.fill(config.user);}else{await account.fill(config.user);}
   const passwords=page.locator('input[type="password"]:visible');if(await passwords.count()!==1)throw Error('登录页存在多个密码框，请用--manual-login');
   await passwords.fill(password);password=null;
-  await page.locator('button[type="submit"]:visible').first().click({timeout:5000}).catch(()=>{});await passwords.waitFor({state:'hidden',timeout:30000});await engine.navigate(config.url);
+  await page.locator('button[type="submit"]:visible').first().click({timeout:5000}).catch(()=>{});
+  // 2026-10-04 修复：CMS 登录 401 后弹出 2FA Modal，但背后密码框仍可见——
+  // 原实现只等密码框 hidden（30s 超时即抛错），2FA 场景永远走不到下面弹窗分支。
+  // 改为竞速：密码框消失（无2FA直登）或 2FA 弹窗出现，二者先到为准。
+  await Promise.race([
+    passwords.waitFor({state:'hidden',timeout:30000}).catch(()=>{}),
+    page.locator('.ant-modal:visible').first().waitFor({state:'visible',timeout:30000}).catch(()=>{})
+  ]);
+  // 2FA 适配：登录提交后若弹出 TOTP Modal（antd），用 TEST_TOTP_SECRET 实时算码填充确认
+  if(process.env.TEST_TOTP_SECRET){
+    const modal=page.locator('.ant-modal:visible');
+    // 竞速已保证弹窗出现时走到这里；再短暂兜底等待弹窗渲染（直登场景 8s 后跳过）
+    try{ await modal.first().waitFor({state:'visible',timeout:8000}); }catch{}
+    if(await modal.count()>0){
+      const code=totpNow(process.env.TEST_TOTP_SECRET);
+      console.log('检测到 2FA 弹窗，填充 TOTP 动态码');
+      await page.locator('.ant-modal input:visible').first().fill(code);
+      await page.locator('.ant-modal .ant-btn-primary:visible').first().click({timeout:5000});
+      await page.waitForTimeout(2500);
+    }
+  }
+  await engine.navigate(config.url);
   if(/login/i.test(new URL(page.url()).pathname))throw Error('自动登录后仍停留在登录页（'+page.url()+'），可能是凭据无效或被限流，请检查 TEST_USER/TEST_PASSWORD');
   // token 在 sessionStorage（storageState 不含），另存快照供下次回放 addInitScript 注入，免重复登录撞限流
   try{const {writeFileSync}=await import('node:fs');const {createHash}=await import('node:crypto');const snap=await page.evaluate(()=>{const o={};for(let i=0;i<sessionStorage.length;i++){const k=sessionStorage.key(i);o[k]=sessionStorage.getItem(k);}return o;});const sf='.laya-auth/'+createHash('sha256').update(String(config.user)).digest('hex').slice(0,16)+'.session.json';writeFileSync(sf,JSON.stringify(snap));console.log('登录态快照已保存：'+sf);}catch(e){console.log('登录态快照保存失败（不影响本次）：'+String(e?.message||e).slice(0,80));}
