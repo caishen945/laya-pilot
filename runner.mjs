@@ -128,7 +128,7 @@ async function main(){
   // 且账号框文案如「管理员邮箱/邮箱地址」与通用意图「账号」不总匹配）
   const account=page.locator('input[type="email"]:visible').first();if(await account.count()===0){const text=page.locator('input:not([type="password"]):visible').first();if(await text.count()===0)throw Error('登录页未找到 email/用户名 输入框，请用 --manual-login');await text.fill(config.user);}else{await account.fill(config.user);}
   const passwords=page.locator('input[type="password"]:visible');if(await passwords.count()!==1)throw Error('登录页存在多个密码框，请用--manual-login');
-  await passwords.fill(password);password=null;
+  await passwords.fill(password);password=null
   await page.locator('button[type="submit"]:visible').first().click({timeout:5000}).catch(()=>{});
   // 2026-10-04 修复：CMS 登录 401 后弹出 2FA Modal，但背后密码框仍可见——
   // 原实现只等密码框 hidden（30s 超时即抛错），2FA 场景永远走不到下面弹窗分支。
